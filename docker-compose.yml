@@ -1,0 +1,38 @@
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: reconai_dev_root
+      MYSQL_DATABASE: reconai
+      MYSQL_USER: reconai_app
+      MYSQL_PASSWORD: reconai_dev_pw
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:3.0
+    environment:
+      SERVICES: s3,sqs
+      DEFAULT_REGION: ap-south-1
+    ports:
+      - "4566:4566"
+
+volumes:
+  mysql_data:

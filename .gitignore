@@ -1,0 +1,27 @@
+# Local documentation and personal artifacts
+docs/
+*.pdf
+
+# Secrets and local environment overrides
+.env
+.env.*
+!.env.example
+
+# Generated data and local service state
+data/landing/*
+!data/landing/.gitkeep
+mysql_data/
+
+# Language and tool artifacts
+bin/
+coverage.out
+*.test
+__pycache__/
+*.py[cod]
+.venv/
+vendor/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
