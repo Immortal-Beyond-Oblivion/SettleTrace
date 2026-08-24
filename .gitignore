@@ -1,5 +1,6 @@
 # Local documentation and personal artifacts
 docs/
+notes/
 *.pdf
 
 # Secrets and local environment overrides
@@ -25,3 +26,10 @@ vendor/
 .DS_Store
 .idea/
 .vscode/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
