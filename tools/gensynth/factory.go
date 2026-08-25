@@ -54,6 +54,7 @@ func GenerateBasePayment(seqID int, baseTime time.Time) PaymentRecord {
 	}
 }
 
+// DeriveSettlement builds a settlement line from a payment and fee/tax deductions.
 func DeriveSettlement(payment PaymentRecord, feePaise int64, taxPaise int64) SettlementLineRecord {
 	return SettlementLineRecord{
 		SettlementID: fmt.Sprintf("setl_synth_%s", payment.PaymentID),
