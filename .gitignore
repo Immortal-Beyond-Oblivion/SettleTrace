@@ -33,3 +33,14 @@ vendor/
 *.tfstate.*
 crash.log
 crash.*.log
+
+# Generated Test Data
+data/landing/webhook/*.json
+data/landing/settlement/*.json
+data/landing/ledger/*.json
+data/landing/*.jsonl
+
+# Compiled Binaries
+*.exe
+*.out
+/bin/
