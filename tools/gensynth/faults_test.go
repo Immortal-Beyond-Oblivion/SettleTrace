@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// TestCorruptUTR verifies that CorruptUTR mutates and shortens the value.
 func TestCorruptUTR(t *testing.T) {
 	original := "1568176960vxp0rj"
 	corrupted := CorruptUTR(original)
@@ -17,6 +18,7 @@ func TestCorruptUTR(t *testing.T) {
 	}
 }
 
+// TestDelayPastSLA verifies that DelayPastSLA applies the configured SLA breach delay.
 func TestDelayPastSLA(t *testing.T) {
 	baseTime := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	delayed := DelayPastSLA(baseTime)
@@ -27,6 +29,7 @@ func TestDelayPastSLA(t *testing.T) {
 	}
 }
 
+// TestFatFingerAmount verifies that FatFingerAmount introduces the expected amount change.
 func TestFatFingerAmount(t *testing.T) {
 	originalAmount := int64(150000)
 	corruptedAmount := FatFingerAmount(originalAmount)
