@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 )
-
+// TestCorruptUTR verifies that CorruptUTR mutates and shortens the value.
 func TestCorruptUTR(t *testing.T) {
 	original := "1568176960vxp0rj"
 	corrupted := CorruptUTR(original)
@@ -16,7 +16,7 @@ func TestCorruptUTR(t *testing.T) {
 		t.Errorf("Expected corrupted UTR to be shorter, got length %d", len(corrupted))
 	}
 }
-
+// TestDelayPastSLA verifies that DelayPastSLA mutates the time.
 func TestDelayPastSLA(t *testing.T) {
 	baseTime := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	delayed := DelayPastSLA(baseTime)
@@ -27,6 +27,7 @@ func TestDelayPastSLA(t *testing.T) {
 	}
 }
 
+// TestRecordFault verifies that RecordFault appends a new record to the ledger.
 func TestFatFingerAmount(t *testing.T) {
 	originalAmount := int64(150000)
 	corruptedAmount := FatFingerAmount(originalAmount)

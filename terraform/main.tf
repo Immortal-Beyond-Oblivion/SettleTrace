@@ -6,6 +6,13 @@ terraform {
       source = "hashicorp/aws"
     }
   }
+
+  backend "s3" {
+    bucket       = "settletrace-terraform-state-838115391199"
+    key          = "settletrace/terraform.tfstate"
+    region       = "ap-south-1"
+    use_lockfile = true
+  }
 }
 
 provider "aws" {
