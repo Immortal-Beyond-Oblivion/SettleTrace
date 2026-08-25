@@ -14,6 +14,9 @@ func IdempotencyKey(source, externalID, eventType string) string {
 
 // VerifyHMAC verifies a hexadecimal SHA-256 signature over the unmodified request body.
 func VerifyHMAC(body []byte, signatureHex, secret string) bool {
+	if secret == "" || signatureHex == "" {
+		return false
+	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write(body)
 	expected, err := hex.DecodeString(signatureHex)
