@@ -34,5 +34,15 @@ services:
     ports:
       - "4566:4566"
 
+  fuzzy-ranker:
+    build: ./services/fuzzy-ranker
+    ports:
+      - "8001:8001"
+
+  legacy-adapter:
+    build: ./services/legacy-adapter
+    ports:
+      - "8002:8002"
+
 volumes:
   mysql_data:

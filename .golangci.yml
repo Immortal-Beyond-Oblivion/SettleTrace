@@ -1,0 +1,11 @@
+version: "2"
+linters:
+  enable:
+    - revive
+    - staticcheck
+    - errcheck
+  settings:
+    revive:
+      rules:
+        - name: exported
+          arguments: ["checkPrivateReceivers"]

@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS exception_log;
+DROP TABLE IF EXISTS match_results;
+DROP TABLE IF EXISTS batch_queue;
+DROP TABLE IF EXISTS ledger_lines;
+DROP TABLE IF EXISTS bank_lines;
+DROP TABLE IF EXISTS settlement_lines;
+DROP TABLE IF EXISTS payments;
+DROP TABLE IF EXISTS raw_events;
