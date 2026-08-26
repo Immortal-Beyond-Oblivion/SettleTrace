@@ -130,6 +130,8 @@ type fixedClock struct{ at time.Time }
 // Now returns the fixed timestamp this clock was constructed with.
 func (clock fixedClock) Now() time.Time { return clock.at }
 
+
+// TestEngine_RunWindow_Tier1ExactMatchIsRecorded verifies that a payment and settlement candidate that match exactly are recorded as a match.
 func TestEngine_RunWindow_Tier1ExactMatchIsRecorded(t *testing.T) {
 	capturedAt := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
 	fake := newFakeReconStore()
@@ -156,6 +158,8 @@ func TestEngine_RunWindow_Tier1ExactMatchIsRecorded(t *testing.T) {
 	}
 }
 
+
+// TestEngine_RunWindow_NoCandidateProducesException verifies that a payment with no settlement candidates produces an exception.
 func TestEngine_RunWindow_NoCandidateProducesException(t *testing.T) {
 	capturedAt := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
 	fake := newFakeReconStore()
@@ -176,6 +180,7 @@ func TestEngine_RunWindow_NoCandidateProducesException(t *testing.T) {
 	}
 }
 
+// TestEngine_RunWindow_LedgerExactMatchSetsMatchedPayment verifies that a ledger line that matches a payment exactly is recorded as matched, even if the payment has no settlement candidates.
 func TestEngine_RunWindow_LedgerExactMatchSetsMatchedPayment(t *testing.T) {
 	capturedAt := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
 	fake := newFakeReconStore()
@@ -205,6 +210,8 @@ func TestEngine_RunWindow_LedgerExactMatchSetsMatchedPayment(t *testing.T) {
 	}
 }
 
+
+// TestEngine_RunWindow_Tier3RanksAmbiguous
 func TestEngine_RunWindow_Tier3RanksAmbiguousPaymentWhenConfigured(t *testing.T) {
 	capturedAt := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
 	fake := newFakeReconStore()
@@ -249,6 +256,8 @@ func TestEngine_RunWindow_Tier3RanksAmbiguousPaymentWhenConfigured(t *testing.T)
 	}
 }
 
+
+// TestEngine_RunWindow_Tier3FailureDegradesToPlainException verifies that if the Tier3 service is unavailable, the engine still produces a plain exception and does not fail the batch.
 func TestEngine_RunWindow_Tier3FailureDegradesToPlainException(t *testing.T) {
 	capturedAt := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
 	fake := newFakeReconStore()
