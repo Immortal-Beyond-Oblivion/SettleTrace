@@ -2,7 +2,9 @@ package ingestion
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/recon"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/schema"
@@ -117,8 +119,39 @@ func (pipeline Pipeline) persist(ctx context.Context, record Record) (Status, er
 	if err != nil {
 		return "", err
 	}
+	if auditErr := pipeline.writeIngestAudit(ctx, record); auditErr != nil {
+		return "", fmt.Errorf("write ingest audit entry: %w", auditErr)
+	}
 	_ = pipeline.Cache.Mark(ctx, record.IdempotencyKey)
 	return StatusApplied, nil
+}
+
+// writeIngestAudit appends a hash-chained audit_log entry for one committed raw event, closing
+// the gap state.md previously flagged: the matching engine's writes were audited (via
+// ReconStore.WriteAuditEntry), but ingestion's writes were not, so the append-only audit
+// guarantee did not actually cover the point where data first enters the system. This is a
+// no-op, not an error, when the configured store does not support audit writes (for example
+// MemoryStore, the in-process fake used by ingestion's unit tests), since audit coverage is a
+// MySQLStore capability, not a contract every IngestStore implementation must satisfy.
+func (pipeline Pipeline) writeIngestAudit(ctx context.Context, record Record) error {
+	auditor, ok := pipeline.Store.(store.AuditWriter)
+	if !ok {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]any{
+		"source":          record.Source,
+		"external_id":     record.ExternalID,
+		"event_type":      record.EventType,
+		"idempotency_key": record.IdempotencyKey,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal ingest audit payload: %w", err)
+	}
+	return auditor.WriteAuditEntry(ctx, store.AuditEntryRow{
+		EventType:   "RAW_EVENT_INGESTED",
+		PayloadJSON: payload,
+		CreatedAt:   pipeline.Clock.Now().UTC(),
+	})
 }
 
 // insertNormalized writes the typed row that belongs to a validated record.

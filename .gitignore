@@ -1,3 +1,7 @@
+# MCP Files
+*.md
+!README.md
+
 # Local documentation and personal artifacts
 docs/
 notes/
