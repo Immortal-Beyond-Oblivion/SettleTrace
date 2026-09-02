@@ -151,6 +151,67 @@ type AuditEntryRow struct {
 	CreatedAt   time.Time
 }
 
+// AIExplanationLogRow is one persisted record of an AI explainer invocation, written whether
+// or not the underlying LLM call succeeded. implementation.md section 8/section 24 requires
+// this: "every AI-generated sentence is stored, permanently," including a failed or
+// budget/circuit-skipped attempt, so a reviewer can always see exactly what was asked, what
+// (if anything) came back, and why.
+type AIExplanationLogRow struct {
+	ExceptionID      int64
+	PromptVersion    string
+	Model            string
+	InputSummaryJSON json.RawMessage
+	OutputText       string
+	LatencyMS        int64
+	Succeeded        bool
+	ErrorMessage     string
+	CreatedAt        time.Time
+}
+
+// ErrExceptionNotFound is returned by GetExceptionByID when no exception_log row matches --
+// callers (internal/api's explain handler) map this to a 404, distinct from a genuine query
+// failure, which maps to a 500.
+var ErrExceptionNotFound = errors.New("exception not found")
+
+// ExceptionRecord is one persisted exception_log row, returned by ID. Kept separate from
+// ExceptionRow (the write-side shape the matching engine appends) because a read needs the
+// row's own primary key and resolution state, neither of which the writer ever supplies, and
+// giving the read path its own type keeps ExceptionRow's "this is an insert-only shape"
+// contract honest.
+type ExceptionRecord struct {
+	ID                int64
+	RecordType        string
+	RecordID          string
+	ReasonCode        string
+	AmountAtRiskPaise int64
+	EvidenceJSON      json.RawMessage
+	ResolvedAt        *time.Time
+	CreatedAt         time.Time
+}
+
+// ExceptionReader is satisfied by any store that can look up one exception_log row by its
+// primary key. Kept separate from ReconStore, mirroring AIExplanationLogWriter's reasoning
+// below: the API's explain handler only ever needs this one narrow read and should not be
+// handed the rest of ReconStore's write surface (WriteMatchResult, SetLedgerMatchedPayment,
+// etc.) -- there is no code path through this interface that could let the AI-adjacent HTTP
+// layer mutate reconciliation state, matching architecture.md section 9's read-only boundary
+// at the Go-interface level, not just the database-grant level (README section 11/23).
+type ExceptionReader interface {
+	GetExceptionByID(ctx context.Context, id int64) (ExceptionRecord, error)
+}
+
+// AIExplanationLogWriter is satisfied by any store that can persist an ai_explanation_log
+// row. Kept separate from ReconStore, mirroring AuditWriter's reasoning above: the AI layer
+// only ever needs this one narrow write capability and should not be handed the rest of
+// ReconStore's surface -- in particular, nothing in internal/ai can call WriteMatchResult or
+// SetLedgerMatchedPayment. The read-only-DB-grant boundary implementation.md section 11/23
+// describes is enforced at the database-user level in prod, and mirrored here at the
+// Go-interface level so a caller can't even compile a path that hands the AI layer more than
+// this.
+type AIExplanationLogWriter interface {
+	WriteAIExplanationLog(ctx context.Context, log AIExplanationLogRow) error
+}
+
 // ReconStore reads matching candidates and persists deterministic reconciliation outcomes.
 // It is kept separate from IngestStore because ingestion and matching have different
 // failure domains and different callers: the matching engine never ingests, and the

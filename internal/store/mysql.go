@@ -398,3 +398,53 @@ func (store *MySQLStore) SetLedgerMatchedPayment(ctx context.Context, ledgerLine
 	}
 	return nil
 }
+
+// GetExceptionByID reads one exception_log row by primary key for the AI explainer's read
+// path (internal/api's explain handler). Returns ErrExceptionNotFound when no row matches,
+// so the caller can respond 404 rather than a generic 500.
+func (store *MySQLStore) GetExceptionByID(ctx context.Context, id int64) (ExceptionRecord, error) {
+	row := store.db.QueryRowContext(ctx, `
+		SELECT id, record_type, record_id, reason_code, amount_at_risk_paise, evidence_json, resolved_at, created_at
+		FROM exception_log
+		WHERE id = ?`,
+		id,
+	)
+	var record ExceptionRecord
+	var evidence []byte
+	var resolvedAt sql.NullTime
+	if err := row.Scan(&record.ID, &record.RecordType, &record.RecordID, &record.ReasonCode, &record.AmountAtRiskPaise, &evidence, &resolvedAt, &record.CreatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ExceptionRecord{}, ErrExceptionNotFound
+		}
+		return ExceptionRecord{}, fmt.Errorf("get exception by id: %w", err)
+	}
+	record.EvidenceJSON = json.RawMessage(evidence)
+	record.CreatedAt = record.CreatedAt.UTC()
+	if resolvedAt.Valid {
+		resolved := resolvedAt.Time.UTC()
+		record.ResolvedAt = &resolved
+	}
+	return record, nil
+}
+
+// WriteAIExplanationLog appends one ai_explanation_log row. This is a plain INSERT, called
+// unconditionally by internal/ai's Explainer whether the underlying LLM call succeeded,
+// failed, or was skipped by the budget cap or circuit breaker -- implementation.md section 8's
+// "every AI-generated sentence is stored, permanently" claim is only checkable if this write
+// happens on every path, not just the success path.
+func (store *MySQLStore) WriteAIExplanationLog(ctx context.Context, log AIExplanationLogRow) error {
+	input := log.InputSummaryJSON
+	if input == nil {
+		input = json.RawMessage("{}")
+	}
+	_, err := store.db.ExecContext(ctx, `
+		INSERT INTO ai_explanation_log (
+			exception_id, prompt_version, model, input_summary_json, output_text, latency_ms, succeeded, error_message, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		log.ExceptionID, log.PromptVersion, log.Model, []byte(input), log.OutputText, log.LatencyMS, log.Succeeded, nullString(log.ErrorMessage), log.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("write ai explanation log: %w", err)
+	}
+	return nil
+}
