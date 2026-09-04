@@ -139,11 +139,18 @@ func (engine *Engine) classifyAfterTier2(ctx context.Context, payment recon.Paym
 	}
 }
 
-// runLedgerSide loads every currently unmatched ledger line (not window-bounded; see
-// state.md section 5.4) and matches it against payments captured in a booking-lag-widened
-// window around [start, end).
+// runLedgerSide loads unmatched ledger lines booked within a doubly-widened window around
+// [start, end) and matches them against payments captured in a booking-lag-widened window.
+// TierL.TryExactMatch/Classify accept a ledger line whose booked_at is within 3 days of a
+// payment's captured_at, and the payment side is already loaded from [start-lag, end+lag) --
+// so a ledger line could pair with a payment as far as another `lag` beyond that, hence the
+// ledger query itself widens by 2*lag rather than 1*lag to guarantee no in-window match is
+// missed. This bound turns the query from a full-table scan into a targeted index range scan
+// against idx_ledger_unmatched_booked (migration 0005).
 func (engine *Engine) runLedgerSide(ctx context.Context, start, end time.Time, report *Report) error {
-	ledgerRows, err := engine.Store.GetUnmatchedLedgerLines(ctx)
+	ledgerWindowStart := start.Add(-2 * ledgerBookingLagWindow)
+	ledgerWindowEnd := end.Add(2 * ledgerBookingLagWindow)
+	ledgerRows, err := engine.Store.GetUnmatchedLedgerLines(ctx, ledgerWindowStart, ledgerWindowEnd)
 	if err != nil {
 		return fmt.Errorf("load unmatched ledger lines: %w", err)
 	}

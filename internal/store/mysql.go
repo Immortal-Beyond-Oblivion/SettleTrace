@@ -275,13 +275,17 @@ func (store *MySQLStore) GetSettlementCandidates(ctx context.Context, method str
 	return candidates, rows.Err()
 }
 
-// GetUnmatchedLedgerLines returns ledger lines that have not yet resolved to a payment.
-func (store *MySQLStore) GetUnmatchedLedgerLines(ctx context.Context) ([]LedgerCandidate, error) {
+// GetUnmatchedLedgerLines returns ledger lines that have not yet resolved to a payment and
+// were booked in [start, end). Bounding by booked_at keeps this a targeted index range scan
+// instead of a full-table scan of every unmatched ledger row ever ingested; callers pass an
+// already-widened window (see matcher.ledgerBookingLagWindow) so no in-window match is missed.
+func (store *MySQLStore) GetUnmatchedLedgerLines(ctx context.Context, start, end time.Time) ([]LedgerCandidate, error) {
 	rows, err := store.db.QueryContext(ctx, `
 		SELECT id, reference_id, amount_paise, booked_at
 		FROM ledger_lines
-		WHERE matched_payment_id IS NULL
+		WHERE matched_payment_id IS NULL AND booked_at >= ? AND booked_at < ?
 		ORDER BY booked_at ASC`,
+		start.UTC(), end.UTC(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query unmatched ledger lines: %w", err)

@@ -70,11 +70,16 @@ func (fake *fakeReconStore) GetSettlementCandidates(_ context.Context, method st
 	return out, nil
 }
 
-// GetUnmatchedLedgerLines returns fixture ledger lines with no recorded matched payment.
-func (fake *fakeReconStore) GetUnmatchedLedgerLines(_ context.Context) ([]store.LedgerCandidate, error) {
+// GetUnmatchedLedgerLines returns fixture ledger lines with no recorded matched payment,
+// booked within [start, end) -- mirroring MySQLStore's new window-bounded query so tests
+// exercise the same contract the real store now enforces.
+func (fake *fakeReconStore) GetUnmatchedLedgerLines(_ context.Context, start, end time.Time) ([]store.LedgerCandidate, error) {
 	out := make([]store.LedgerCandidate, 0)
 	for _, line := range fake.ledgerLines {
 		if _, matched := fake.matchedLedger[line.ID]; matched {
+			continue
+		}
+		if line.BookedAt.Before(start) || !line.BookedAt.Before(end) {
 			continue
 		}
 		out = append(out, line)

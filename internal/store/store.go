@@ -212,6 +212,53 @@ type AIExplanationLogWriter interface {
 	WriteAIExplanationLog(ctx context.Context, log AIExplanationLogRow) error
 }
 
+// WhyNotSettledRow is one exception_log row returned for a specific payment record, answering
+// "why didn't payment X settle" questions (implementation.md section 2.4/8). Kept as its own
+// type rather than reusing ExceptionRecord because the Q&A agent's fixed-template contract is
+// intentionally narrower than the exception API's -- adding a field to ExceptionRecord later
+// should never silently widen what this template returns.
+type WhyNotSettledRow struct {
+	ReasonCode        string
+	EvidenceJSON      json.RawMessage
+	AmountAtRiskPaise int64
+	ResolvedAt        *time.Time
+}
+
+// ReasonAggregateRow is one row of unresolved exception amount and count, grouped by reason
+// code. Note: implementation.md section 8's sketch of this template groups by a batch_run_id
+// column; exception_log (migrations/0001_core.up.sql) has no such column, so this grouping is
+// by reason_code instead -- the closest real-schema equivalent of "how much is at risk right
+// now, broken down," which is what the "how much/many" question pattern actually asks for.
+type ReasonAggregateRow struct {
+	ReasonCode       string
+	TotalAtRiskPaise int64
+	Count            int
+}
+
+// MethodMatchRateRow is one row of a payment method's match rate over a window, worst first.
+type MethodMatchRateRow struct {
+	Method    string
+	MatchRate float64
+}
+
+// QAStore is the entire fixed universe of read queries the Settlement Q&A agent
+// (internal/ai/qa) can ever execute -- implementation.md section 8's "template-and-retrieve,"
+// not "LLM with SQL tool access," boundary enforced at the Go-interface level: there is no
+// method here that accepts a caller-built query string. Adding a new Q&A capability means
+// adding a new method here, which is a code review event, never something a question's
+// wording alone can trigger at runtime.
+type QAStore interface {
+	// WhyNotSettled returns every exception_log row on record for one payment, most recent
+	// first, answering "why didn't payment X settle" questions.
+	WhyNotSettled(ctx context.Context, paymentID string) ([]WhyNotSettledRow, error)
+	// UnresolvedAmountByReason returns current unresolved exception amount/count grouped by
+	// reason code, worst (highest amount at risk) first.
+	UnresolvedAmountByReason(ctx context.Context) ([]ReasonAggregateRow, error)
+	// WorstMethodsByMatchRate returns up to limit payment methods captured since the given
+	// time, ordered by match rate ascending (worst-performing method first).
+	WorstMethodsByMatchRate(ctx context.Context, since time.Time, limit int) ([]MethodMatchRateRow, error)
+}
+
 // ReconStore reads matching candidates and persists deterministic reconciliation outcomes.
 // It is kept separate from IngestStore because ingestion and matching have different
 // failure domains and different callers: the matching engine never ingests, and the
@@ -225,8 +272,12 @@ type ReconStore interface {
 	GetPaymentsInWindow(ctx context.Context, start, end time.Time) ([]PaymentCandidate, error)
 	// GetSettlementCandidates returns settlement lines for one method settled in [start, end).
 	GetSettlementCandidates(ctx context.Context, method string, start, end time.Time) ([]SettlementCandidate, error)
-	// GetUnmatchedLedgerLines returns ledger lines with no matched_payment_id yet.
-	GetUnmatchedLedgerLines(ctx context.Context) ([]LedgerCandidate, error)
+	// GetUnmatchedLedgerLines returns ledger lines with no matched_payment_id yet, booked in
+	// [start, end). Callers are expected to widen [start, end) by whatever booking-lag
+	// tolerance their matching tier uses (see matcher.ledgerBookingLagWindow) before calling,
+	// since a ledger line booked outside that widened range cannot match any payment the
+	// caller will also load for the same window.
+	GetUnmatchedLedgerLines(ctx context.Context, start, end time.Time) ([]LedgerCandidate, error)
 	// WriteMatchResult appends a reconciliation match; there is no corresponding update method.
 	WriteMatchResult(ctx context.Context, match MatchResultRow) error
 	// WriteExceptionLog appends an unresolved reconciliation exception.
