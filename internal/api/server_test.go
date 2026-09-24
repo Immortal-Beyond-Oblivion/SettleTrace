@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/ai"
+	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/recon"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/store"
 )
 
@@ -24,11 +25,22 @@ func TestResolveExceptionRejectsAI(t *testing.T) {
 	}
 }
 
-// fakeExceptionReader is a hand-rolled store.ExceptionReader fake, following this repo's
-// no-mocking-library convention (see internal/ai/explainer_test.go's fakeLLMClient).
+// fakeExceptionReader is a hand-rolled store.ExceptionReader (+ store.ExceptionLister) fake,
+// following this repo's no-mocking-library convention (see internal/ai/explainer_test.go's
+// fakeLLMClient). It satisfies both interfaces from one type -- same as MySQLStore does in
+// production -- so tests for either explainException or listExceptions can share it without
+// a second fake type.
 type fakeExceptionReader struct {
 	records map[int64]store.ExceptionRecord
 	err     error // returned for any id not in records; defaults to store.ErrExceptionNotFound
+
+	// list, listErr back ListUnresolvedExceptions. list is expected pre-sorted by the caller
+	// (amount_at_risk_paise DESC, id DESC), matching what MySQLStore's real query guarantees --
+	// this fake does no sorting of its own, same as fakeReconStore's fixtures elsewhere in
+	// this repo trusting the test author to hand in data already shaped like the real query's
+	// contract.
+	list    []store.ExceptionRecord
+	listErr error
 }
 
 func (fake *fakeExceptionReader) GetExceptionByID(_ context.Context, id int64) (store.ExceptionRecord, error) {
@@ -39,6 +51,29 @@ func (fake *fakeExceptionReader) GetExceptionByID(_ context.Context, id int64) (
 		return store.ExceptionRecord{}, fake.err
 	}
 	return store.ExceptionRecord{}, store.ErrExceptionNotFound
+}
+
+func (fake *fakeExceptionReader) ListUnresolvedExceptions(_ context.Context, limit int, cursor *store.ExceptionCursor) ([]store.ExceptionRecord, error) {
+	if fake.listErr != nil {
+		return nil, fake.listErr
+	}
+	start := 0
+	if cursor != nil {
+		for i, record := range fake.list {
+			if record.AmountAtRiskPaise == cursor.AmountAtRiskPaise && record.ID == cursor.ID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(fake.list) {
+		end = len(fake.list)
+	}
+	if start > end {
+		start = end
+	}
+	return fake.list[start:end], nil
 }
 
 // fakeLLMClient is a hand-rolled ai.LLMClient fake, mirroring internal/ai/explainer_test.go's
@@ -204,5 +239,126 @@ func TestExplainException_LLMFailureDegradesTo200WithGenericSkipMessage(t *testi
 	// LLM error is logged server-side (log.Printf), never leaked into the HTTP response.
 	if body["explanation_skipped"] != "explanation temporarily unavailable" {
 		t.Fatalf("expected the generic skip message, got %+v", body)
+	}
+}
+
+// TestListExceptions_FallsBackToInMemorySliceWhenStoreNotConfigured covers the zero-config
+// dev smoke-test path: Store is nil (the default zero value), so listExceptions must serve
+// whatever was injected into Exceptions rather than erroring or panicking on the type
+// assertion to store.ExceptionLister.
+func TestListExceptions_FallsBackToInMemorySliceWhenStoreNotConfigured(t *testing.T) {
+	server := Server{Exceptions: []recon.Exception{{ReasonCode: "NO_CANDIDATE_IN_WINDOW"}}}
+	request := httptest.NewRequest(http.MethodGet, "/v1/exceptions", nil)
+	response := httptest.NewRecorder()
+	server.Routes().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected %d, got %d", http.StatusOK, response.Code)
+	}
+	body := decodeJSONBody(t, response)
+	exceptions, ok := body["exceptions"].([]any)
+	if !ok || len(exceptions) != 1 {
+		t.Fatalf("expected the injected Exceptions slice to be served as-is, got %+v", body)
+	}
+	if _, hasCursor := body["next_cursor"]; hasCursor {
+		t.Fatalf("did not expect a next_cursor on the in-memory fallback path, got %+v", body)
+	}
+}
+
+// TestListExceptions_ReturnsDBBackedResultsWithoutNextCursorOnAShortPage covers the real,
+// store-backed path added this session: when Store implements store.ExceptionLister and the
+// page comes back shorter than the requested limit, that's the last page, so no next_cursor
+// should be emitted.
+func TestListExceptions_ReturnsDBBackedResultsWithoutNextCursorOnAShortPage(t *testing.T) {
+	server := Server{
+		Store: &fakeExceptionReader{list: []store.ExceptionRecord{
+			{ID: 2, ReasonCode: "MULTI_CANDIDATE_AMBIGUOUS", AmountAtRiskPaise: 250000, EvidenceJSON: json.RawMessage(`{"candidates":3}`)},
+			{ID: 1, ReasonCode: "NO_CANDIDATE_IN_WINDOW", AmountAtRiskPaise: 5000, EvidenceJSON: json.RawMessage(`{}`)},
+		}},
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/exceptions", nil)
+	response := httptest.NewRecorder()
+	server.Routes().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected %d, got %d", http.StatusOK, response.Code)
+	}
+	body := decodeJSONBody(t, response)
+	exceptions, ok := body["exceptions"].([]any)
+	if !ok || len(exceptions) != 2 {
+		t.Fatalf("expected both fixture rows, got %+v", body)
+	}
+	first, ok := exceptions[0].(map[string]any)
+	if !ok || first["reason_code"] != "MULTI_CANDIDATE_AMBIGUOUS" {
+		t.Fatalf("expected the worst (highest amount-at-risk) row first, got %+v", exceptions)
+	}
+	if _, hasCursor := body["next_cursor"]; hasCursor {
+		t.Fatalf("did not expect a next_cursor when the page is shorter than the limit, got %+v", body)
+	}
+}
+
+// TestListExceptions_SetsNextCursorOnAFullPageAndItRoundTrips covers pagination end to end:
+// a full page (limit=1 against two fixture rows) must carry a next_cursor, and re-requesting
+// with that exact cursor must resume from the second row, not repeat or skip it.
+func TestListExceptions_SetsNextCursorOnAFullPageAndItRoundTrips(t *testing.T) {
+	fake := &fakeExceptionReader{list: []store.ExceptionRecord{
+		{ID: 2, ReasonCode: "MULTI_CANDIDATE_AMBIGUOUS", AmountAtRiskPaise: 250000, EvidenceJSON: json.RawMessage(`{}`)},
+		{ID: 1, ReasonCode: "NO_CANDIDATE_IN_WINDOW", AmountAtRiskPaise: 5000, EvidenceJSON: json.RawMessage(`{}`)},
+	}}
+	server := Server{Store: fake}
+
+	firstRequest := httptest.NewRequest(http.MethodGet, "/v1/exceptions?limit=1", nil)
+	firstResponse := httptest.NewRecorder()
+	server.Routes().ServeHTTP(firstResponse, firstRequest)
+	firstBody := decodeJSONBody(t, firstResponse)
+
+	cursor, ok := firstBody["next_cursor"].(string)
+	if !ok || cursor == "" {
+		t.Fatalf("expected a next_cursor on a full page, got %+v", firstBody)
+	}
+
+	secondRequest := httptest.NewRequest(http.MethodGet, "/v1/exceptions?limit=1&cursor="+cursor, nil)
+	secondResponse := httptest.NewRecorder()
+	server.Routes().ServeHTTP(secondResponse, secondRequest)
+	if secondResponse.Code != http.StatusOK {
+		t.Fatalf("expected %d, got %d", http.StatusOK, secondResponse.Code)
+	}
+	secondBody := decodeJSONBody(t, secondResponse)
+	exceptions, ok := secondBody["exceptions"].([]any)
+	if !ok || len(exceptions) != 1 {
+		t.Fatalf("expected exactly the second fixture row, got %+v", secondBody)
+	}
+	row, ok := exceptions[0].(map[string]any)
+	if !ok || row["reason_code"] != "NO_CANDIDATE_IN_WINDOW" {
+		t.Fatalf("expected the cursor to resume at the second row, got %+v", exceptions)
+	}
+	if _, hasCursor := secondBody["next_cursor"]; hasCursor {
+		t.Fatalf("expected no next_cursor once the last row has been returned, got %+v", secondBody)
+	}
+}
+
+// TestListExceptions_InvalidCursorReturns400 guards against a malformed/tampered cursor value
+// being silently treated as "no cursor" (which would restart pagination from the top instead
+// of surfacing the caller's mistake) or crashing the handler.
+func TestListExceptions_InvalidCursorReturns400(t *testing.T) {
+	server := Server{Store: &fakeExceptionReader{}}
+	request := httptest.NewRequest(http.MethodGet, "/v1/exceptions?cursor=not-valid-base64!!", nil)
+	response := httptest.NewRecorder()
+	server.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected %d, got %d", http.StatusBadRequest, response.Code)
+	}
+}
+
+// TestListExceptions_StoreErrorReturns500 covers the real-query-failed path distinctly from
+// the not-configured (nil Store) fallback above -- a store that IS configured but returns an
+// error must not be silently swallowed into an empty 200.
+func TestListExceptions_StoreErrorReturns500(t *testing.T) {
+	server := Server{Store: &fakeExceptionReader{listErr: errors.New("connection refused")}}
+	request := httptest.NewRequest(http.MethodGet, "/v1/exceptions", nil)
+	response := httptest.NewRecorder()
+	server.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("expected %d, got %d", http.StatusInternalServerError, response.Code)
 	}
 }

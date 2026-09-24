@@ -200,6 +200,33 @@ type ExceptionReader interface {
 	GetExceptionByID(ctx context.Context, id int64) (ExceptionRecord, error)
 }
 
+// ExceptionCursor is a keyset-pagination position into exception_log's own
+// (amount_at_risk_paise DESC, id DESC) ordering -- the exact tuple idx_exception_risk
+// (migrations/0001_core.up.sql) is built to serve, and the ordering implementation.md
+// section 26 documents for GET /v1/exceptions ("sorted by amount_at_risk_paise DESC by
+// default, matching the dashboard's default view"). A nil cursor means "start from the
+// single highest amount-at-risk row."
+type ExceptionCursor struct {
+	AmountAtRiskPaise int64
+	ID                int64
+}
+
+// ExceptionLister is satisfied by any store that can page through unresolved exception_log
+// rows worst-amount-first. Kept as its own narrow interface rather than folded into
+// ExceptionReader, mirroring this file's existing one-interface-per-capability convention
+// (ExceptionReader/AIExplanationLogWriter above): GET /v1/exceptions and
+// POST /v1/exceptions/{id}/explain are different HTTP routes with different read shapes, and
+// a store can satisfy either, both, or neither without the other's method ever needing a
+// stub implementation.
+type ExceptionLister interface {
+	// ListUnresolvedExceptions returns up to limit unresolved (resolved_at IS NULL)
+	// exception_log rows, ordered by amount_at_risk_paise DESC, id DESC. When cursor is
+	// non-nil, only rows strictly after that position in the same ordering are returned, so
+	// a caller can page forward without re-scanning rows it has already seen and without an
+	// OFFSET-based page silently skipping or repeating rows under concurrent inserts.
+	ListUnresolvedExceptions(ctx context.Context, limit int, cursor *ExceptionCursor) ([]ExceptionRecord, error)
+}
+
 // AIExplanationLogWriter is satisfied by any store that can persist an ai_explanation_log
 // row. Kept separate from ReconStore, mirroring AuditWriter's reasoning above: the AI layer
 // only ever needs this one narrow write capability and should not be handed the rest of

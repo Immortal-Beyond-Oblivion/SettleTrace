@@ -2,6 +2,8 @@
 package api
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -9,12 +11,33 @@ import (
 	"strings"
 	"log"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/ai"
+	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/ai/qa"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/recon"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/store"
 )
 
+// QAAnswerer is the one capability POST /v1/qa needs from the Settlement Q&A agent. It is an
+// interface (rather than a concrete *qa.Agent) so handler tests can inject a stub, and so the
+// HTTP layer cannot reach anything on the agent beyond answering a question -- kept separate
+// from ai.Explainer on purpose, per implementation.md section 5's AIExplainer/QAAnswerer split.
+type QAAnswerer interface {
+	Answer(ctx context.Context, question string) (qa.Answer, error)
+}
+
+// maxQARequestBytes and maxQuestionRunes bound POST /v1/qa input. A question is one short
+// sentence; anything larger is rejected before it can reach the classifier or an LLM prompt.
+const (
+	maxQARequestBytes = 8 << 10
+	maxQuestionRunes  = 500
+)
+
 // Server serves batch and exception responses from an injected read model.
 type Server struct {
+	// Exceptions is the zero-configuration fallback GET /v1/exceptions serves when Store is
+	// nil or doesn't implement store.ExceptionLister -- kept so the ingestion/matching-only
+	// dev smoke test path (implementation.md section 12) still returns something before a
+	// database is wired up. Once Store implements ExceptionLister, real exception_log rows
+	// take over and this field is ignored by that route.
 	Exceptions []recon.Exception
 
 	// Store and Explainer back POST /v1/exceptions/{id}/explain. Both are optional: when
@@ -31,6 +54,10 @@ type Server struct {
 	// one fixed, always-on budget bucket rather than a real batch_run_id. Defaults to
 	// "api:adhoc" when empty.
 	AdHocBatchRunID string
+
+	// QA backs POST /v1/qa. Optional: when nil the route degrades to 503, same convention as
+	// Store/Explainer above, so the API still starts and serves every other route without it.
+	QA QAAnswerer
 }
 
 // Routes returns the configured HTTP handler tree.
@@ -40,6 +67,7 @@ func (server Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/exceptions", server.listExceptions)
 	mux.HandleFunc("POST /v1/exceptions/", server.resolveException)
 	mux.HandleFunc("POST /v1/exceptions/{id}/explain", server.explainException)
+	mux.HandleFunc("POST /v1/qa", server.askQuestion)
 	return mux
 }
 
@@ -48,9 +76,90 @@ func (server Server) health(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// listExceptions returns the current read model in its amount-at-risk ordering.
-func (server Server) listExceptions(writer http.ResponseWriter, _ *http.Request) {
-	writeJSON(writer, http.StatusOK, map[string]any{"exceptions": server.Exceptions})
+// listExceptions returns unresolved exceptions worst-amount-at-risk first, reading real
+// exception_log rows via keyset (cursor) pagination when Store supports it -- implementation.md
+// section 26's documented shape ("sorted by amount_at_risk_paise DESC by default", a
+// next_cursor for paging). Falls back to the injected Server.Exceptions slice when Store is
+// nil or doesn't implement store.ExceptionLister, matching this file's established
+// "not configured degrades gracefully, never panics" convention for explainException above.
+func (server Server) listExceptions(writer http.ResponseWriter, request *http.Request) {
+	lister, ok := server.Store.(store.ExceptionLister)
+	if !ok {
+		writeJSON(writer, http.StatusOK, map[string]any{"exceptions": server.Exceptions})
+		return
+	}
+
+	limit := 50
+	if raw := request.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 200 {
+			limit = parsed
+		}
+	}
+
+	var cursor *store.ExceptionCursor
+	if raw := request.URL.Query().Get("cursor"); raw != "" {
+		decoded, err := decodeExceptionCursor(raw)
+		if err != nil {
+			writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+			return
+		}
+		cursor = decoded
+	}
+
+	records, err := lister.ListUnresolvedExceptions(request.Context(), limit, cursor)
+	if err != nil {
+		writeJSON(writer, http.StatusInternalServerError, map[string]string{"error": "failed to load exceptions"})
+		return
+	}
+
+	exceptions := make([]map[string]any, 0, len(records))
+	for _, record := range records {
+		exceptions = append(exceptions, map[string]any{
+			"id":                    record.ID,
+			"reason_code":           record.ReasonCode,
+			"amount_at_risk_paise":  record.AmountAtRiskPaise,
+			"evidence":              record.EvidenceJSON,
+			"resolved_at":           record.ResolvedAt,
+		})
+	}
+
+	response := map[string]any{"exceptions": exceptions}
+	// A next_cursor is only emitted when the page came back full -- a short page means this
+	// was the last one, and handing back a cursor anyway would let a caller make one more
+	// pointless round trip that returns zero rows.
+	if len(records) == limit {
+		last := records[len(records)-1]
+		response["next_cursor"] = encodeExceptionCursor(store.ExceptionCursor{AmountAtRiskPaise: last.AmountAtRiskPaise, ID: last.ID})
+	}
+	writeJSON(writer, http.StatusOK, response)
+}
+
+// exceptionCursorPayload is the JSON shape base64-encoded into a next_cursor value --
+// implementation.md section 26's example ("next_cursor": "eyJpZCI6NDgyMX0=", which decodes to
+// {"id":4821}) is a plain base64'd JSON object, not an opaque token with a bespoke encoding;
+// this keeps that same inspectable shape, with amount_at_risk_paise added since this listing's
+// keyset needs both halves of the (amount_at_risk_paise, id) ordering tuple to resume
+// correctly, not just id alone.
+type exceptionCursorPayload struct {
+	AmountAtRiskPaise int64 `json:"amount_at_risk_paise"`
+	ID                int64 `json:"id"`
+}
+
+func encodeExceptionCursor(cursor store.ExceptionCursor) string {
+	payload, _ := json.Marshal(exceptionCursorPayload{AmountAtRiskPaise: cursor.AmountAtRiskPaise, ID: cursor.ID})
+	return base64.StdEncoding.EncodeToString(payload)
+}
+
+func decodeExceptionCursor(raw string) (*store.ExceptionCursor, error) {
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, err
+	}
+	var payload exceptionCursorPayload
+	if err := json.Unmarshal(decoded, &payload); err != nil {
+		return nil, err
+	}
+	return &store.ExceptionCursor{AmountAtRiskPaise: payload.AmountAtRiskPaise, ID: payload.ID}, nil
 }
 
 // resolveException rejects AI actors because AI is forbidden from resolving financial outcomes.
@@ -128,6 +237,44 @@ func (server Server) explainException(writer http.ResponseWriter, request *http.
 		response["explanation_skipped"] = "explanation temporarily unavailable"
 	}
 	writeJSON(writer, http.StatusOK, response)
+}
+
+// askQuestion answers one operator question through the Settlement Q&A agent. The request body
+// is {"question": "..."}; the response is qa.Answer -- the answer text plus the raw evidence rows
+// it came from, always together (implementation.md section 26). An LLM problem never surfaces
+// here as an HTTP error: the agent degrades to a deterministic summary of the same rows, so the
+// only 5xx paths are "not configured" (503) and a genuine store failure (500).
+func (server Server) askQuestion(writer http.ResponseWriter, request *http.Request) {
+	if server.QA == nil {
+		writeJSON(writer, http.StatusServiceUnavailable, map[string]string{"error": "qa agent not configured"})
+		return
+	}
+
+	request.Body = http.MaxBytesReader(writer, request.Body, maxQARequestBytes)
+	var payload struct {
+		Question string `json:"question"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+		writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	question := strings.TrimSpace(payload.Question)
+	if question == "" {
+		writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "question is required"})
+		return
+	}
+	if len([]rune(question)) > maxQuestionRunes {
+		writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "question is too long"})
+		return
+	}
+
+	answer, err := server.QA.Answer(request.Context(), question)
+	if err != nil {
+		log.Printf("qa agent failed: %v", err)
+		writeJSON(writer, http.StatusInternalServerError, map[string]string{"error": "failed to answer question"})
+		return
+	}
+	writeJSON(writer, http.StatusOK, answer)
 }
 
 // writeJSON writes one JSON response with a deterministic content type.

@@ -11,18 +11,22 @@ import (
 	"time"
 
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/ai"
+	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/ai/qa"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/api"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/store"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/redis/go-redis/v9"
 )
 
-// main starts the API on the configured local address. When DB_DSN is set, it also wires the
+// main starts the API on the configured local address. When DB_DSN is set, GET /v1/exceptions
+// becomes DB-backed (real, paginated exception_log rows via store.ExceptionLister, worst
+// amount-at-risk first -- see internal/api/server.go's listExceptions) and it also wires the
 // AI explainer (GEMINI_API_KEY/LLM_MODEL, AI_BUDGET_PER_BATCH_USD, REDIS_ADDR) behind
 // POST /v1/exceptions/{id}/explain. When DB_DSN is unset, the API still starts -- with
-// /v1/exceptions and the explain route degrading to their "not configured" responses --
-// because the ingestion/matching-only smoke test path (implementation.md section 12) must
-// keep working even before a database or the AI layer is configured.
+// /v1/exceptions falling back to whatever's in Server.Exceptions (empty by default here) and
+// the explain route degrading to its "not configured" response -- because the
+// ingestion/matching-only smoke test path (implementation.md section 12) must keep working
+// even before a database or the AI layer is configured.
 func main() {
 	address := os.Getenv("API_ADDR")
 	if address == "" {
@@ -54,6 +58,7 @@ func main() {
 		mysqlStore := store.OpenMySQLStore(db)
 		server.Store = mysqlStore
 		server.Explainer = buildExplainer(mysqlStore)
+		server.QA = buildQAAgent(mysqlStore, server.Explainer)
 	}
 
 	log.Printf("starting api on %s", address)
@@ -98,6 +103,35 @@ func buildExplainer(logWriter store.AIExplanationLogWriter) *ai.Explainer {
 		ModelName:     firstNonEmpty(model, "unknown"),
 		Timeout:       5 * time.Second,
 	}
+}
+
+// buildQAAgent wires the Settlement Q&A agent (POST /v1/qa). It deliberately reuses the
+// explainer's LLM client, budget tracker, and circuit breaker rather than building its own: both
+// features call the same upstream model, so one outage should trip one breaker, and both draw on
+// the same Redis-backed spend cap (under a different bucket key, "api:qa", set by qa.Agent's
+// default). The agent's only database access is store.QAStore -- three fixed, read-only queries.
+// Like buildExplainer it never fails startup: a missing prompt file just means the model gets no
+// system prompt, and with no LLM configured the agent answers from its deterministic summaries.
+func buildQAAgent(qaStore store.QAStore, explainer *ai.Explainer) *qa.Agent {
+	systemPrompt := ""
+	if raw, err := os.ReadFile("internal/ai/prompts/v1/qa_system.txt"); err == nil {
+		systemPrompt = string(raw)
+	} else {
+		log.Printf("could not read qa system prompt, continuing without one: %v", err)
+	}
+
+	agent := &qa.Agent{
+		Store:         qaStore,
+		SystemPrompt:  systemPrompt,
+		PromptVersion: "v1",
+		Timeout:       5 * time.Second,
+	}
+	if explainer != nil {
+		agent.LLM = explainer.LLM
+		agent.Budget = explainer.Budget
+		agent.Breaker = explainer.Breaker
+	}
+	return agent
 }
 
 // firstNonEmpty returns the first nonempty string.

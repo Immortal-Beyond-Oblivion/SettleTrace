@@ -431,6 +431,58 @@ func (store *MySQLStore) GetExceptionByID(ctx context.Context, id int64) (Except
 	return record, nil
 }
 
+// ListUnresolvedExceptions pages through unresolved exception_log rows worst-amount-first,
+// using idx_exception_risk (amount_at_risk_paise DESC, id DESC -- migrations/0001_core.up.sql)
+// so this is an index range scan, not a sort over the whole table. Keyset (cursor-based)
+// pagination is used instead of OFFSET specifically because implementation.md section 26's
+// documented cursor shape needs to stay stable under concurrent inserts -- an OFFSET-based
+// page silently skips or repeats rows as new exceptions are written between page loads,
+// which a keyset position on the exact tuple the ORDER BY sorts by does not.
+func (store *MySQLStore) ListUnresolvedExceptions(ctx context.Context, limit int, cursor *ExceptionCursor) ([]ExceptionRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+		SELECT id, record_type, record_id, reason_code, amount_at_risk_paise, evidence_json, resolved_at, created_at
+		FROM exception_log
+		WHERE resolved_at IS NULL`
+	args := []any{}
+	if cursor != nil {
+		// Row-value (tuple) comparison, supported by MySQL 8 (Part 0 of implementation.md's
+		// own MySQL-vs-Postgres decision leans on MySQL 8 features exactly like this one) --
+		// equivalent to "strictly after this position in (amount_at_risk_paise DESC, id DESC)
+		// order" without needing a hand-rolled OR/AND expansion of the same comparison.
+		query += ` AND (amount_at_risk_paise, id) < (?, ?)`
+		args = append(args, cursor.AmountAtRiskPaise, cursor.ID)
+	}
+	query += ` ORDER BY amount_at_risk_paise DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := store.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list unresolved exceptions: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]ExceptionRecord, 0)
+	for rows.Next() {
+		var record ExceptionRecord
+		var evidence []byte
+		var resolvedAt sql.NullTime
+		if err := rows.Scan(&record.ID, &record.RecordType, &record.RecordID, &record.ReasonCode, &record.AmountAtRiskPaise, &evidence, &resolvedAt, &record.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan unresolved exception: %w", err)
+		}
+		record.EvidenceJSON = json.RawMessage(evidence)
+		record.CreatedAt = record.CreatedAt.UTC()
+		if resolvedAt.Valid {
+			resolved := resolvedAt.Time.UTC()
+			record.ResolvedAt = &resolved
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 // WriteAIExplanationLog appends one ai_explanation_log row. This is a plain INSERT, called
 // unconditionally by internal/ai's Explainer whether the underlying LLM call succeeded,
 // failed, or was skipped by the budget cap or circuit breaker -- implementation.md section 8's

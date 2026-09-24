@@ -10,21 +10,21 @@ This file is the short version of `state.md`, kept in sync manually at the end o
 
 ## What's working right now
 
-- **Ingestion** (`internal/ingestion`) — schema validation, PCI/PAN rejection, HMAC webhook verification, Redis-fast-path + MySQL-unique-constraint idempotency, transactional writes, local file-watcher and SQS/S3 polling. Migrations auto-apply on startup for every `cmd/*` binary except `cmd/api` (see below).
+- **Ingestion** (`internal/ingestion`) — schema validation, PCI/PAN rejection, HMAC webhook verification, Redis-fast-path + MySQL-unique-constraint idempotency, transactional writes, local file-watcher and SQS/S3 polling. Migrations auto-apply on startup (`store.ApplyMigrations`, tracked in `settletrace_schema_migrations`) for `cmd/api`, `cmd/matching-engine`, and the ingestion worker.
 - **Deterministic matching** (`internal/recon`, `internal/matcher`) — Tier 1 (exact), Tier 2 (bounded fuzzy), Tier 3 (advisory-only ranking via the Python fuzzy-ranker service), and Tier L (ledger matching, ±3-day window). All pure, all unit-tested.
 - **Append-only audit hash chain** (`internal/audit`) — `Seal`/`Verify`; `reconctl verify-chain` works against a real DB.
 - **The AI explainer, end to end** — `internal/ai`'s guardrail core (budget cap, circuit breaker) wraps a real `GeminiLLMClient` (Google Gemini REST API), wired into `cmd/api` behind `POST /v1/exceptions/{id}/explain`. **Manually verified working against a live Gemini call** (see "Last verified" below) — this was the main open question for several sessions and is now resolved.
+- **`GET /v1/exceptions`** — DB-backed, keyset-paginated, worst amount-at-risk first (falls back to an empty in-memory list when `DB_DSN` is unset). *Not yet compiler-verified.*
+- **The Settlement Q&A agent (`internal/ai/qa`, `POST /v1/qa`)** — rule-based intent classifier → one of three fixed, read-only store queries (`store.QAStore`) → optional LLM phrasing constrained to the returned rows, with a deterministic fallback and the raw evidence rows always returned. *Written this session; not yet compiler-verified — run `go build ./... && go test ./...`.*
 - **Infra scaffolding** — `docker-compose.yml`, Terraform, CI (lint/test/terraform-fmt/gitleaks).
 
 ## What's not working / not started
 
-- **The Settlement Q&A agent (`internal/ai/qa`) doesn't exist at all** — no intent classifier, no SQL templates, no `/v1/qa` route. This is the single biggest missing piece relative to `implementation.md`.
-- **`GET /v1/exceptions` is a hardcoded in-memory slice, not a DB read.** `POST /v1/exceptions/{id}/resolve` is still `501`. No `/v1/batches/{id}`, no `/v1/ingest/verify-chain` HTTP route.
+- **`POST /v1/exceptions/{id}/resolve` is still `501`.** No `/v1/batches/{id}`, no `/v1/ingest/verify-chain` HTTP route.
 - **The PHP legacy-adapter service is a no-op** — it wraps the raw payload instead of transforming it.
 - **No batch-queue integration** (`batch_queue` table / `ClaimNextBatch` unused) — the matching engine works on time windows instead.
 - **No property-based or chaos tests.** No benchmark results (`benchmarks/` is empty). No `scripts/localstack_setup.sh`.
-- **`cmd/api/main.go`'s migration-apply call is commented out** — intentional or a regression, not yet confirmed by the owner. See `state.md` §8.
-- **The ledger-side query (`GetUnmatchedLedgerLines`) is unbounded** — scans every unmatched row, a known shortcut.
+- **The Q&A agent has no `audit_log` keyword-search fallback** for unrecognized questions (`implementation.md` §2.4) — unrecognized questions get a fixed "here's what I can answer" reply instead.
 
 ## Last verified (owner, manual, outside a session)
 
@@ -41,12 +41,10 @@ A real explanation came back (not `explanation_skipped`), confirming the Gemini 
 
 Full detail and reasoning in `state.md` §4 — short version:
 
-1. Rebuild/expand test coverage for the AI explain path — **in progress this session**, see `state.md`.
-2. Build the Q&A agent (`internal/ai/qa`) — the largest remaining unit of work.
-3. Make `GET /v1/exceptions` DB-backed; add the missing HTTP routes; finish `/resolve`.
-4. Finish the legacy-adapter, add `localstack_setup.sh`, property/chaos tests, a real benchmark run.
-5. Window-bound `GetUnmatchedLedgerLines`.
-6. Reconcile `architecture.md`/`implementation.md`'s example env vars (they still describe an Anthropic-backed LLM client; the shipped code uses Gemini).
+1. Compiler-verify the last few sessions' changes (`go build ./... && go test ./...`, plus the `integration`-tagged store tests).
+2. Add the missing HTTP routes (`/v1/batches/{id}`, `/v1/ingest/verify-chain`) and finish `/resolve`.
+3. Finish the legacy-adapter, add `localstack_setup.sh`, property/chaos tests, a real benchmark run.
+4. Reconcile `architecture.md`/`implementation.md`'s example env vars (they still describe an Anthropic-backed LLM client; the shipped code uses Gemini).
 
 ## Running it locally
 
@@ -54,8 +52,8 @@ See `implementation.md` Part III (§9-12) for full setup. Quick version:
 
 ```bash
 docker compose up -d mysql redis
-migrate -path ./migrations -database "$DB_DSN" up   # or let cmd/matching-engine/cmd/ingestion-worker auto-apply
-go run ./cmd/api
+set -a && source .env && set +a
+go run ./cmd/api   # applies ./migrations automatically on startup; no separate migrate CLI needed
 ```
 
 `.env.example` documents every environment variable; copy it to `.env` and fill in real values (never commit `.env` — it's git-ignored and gitleaks-checked in CI).
