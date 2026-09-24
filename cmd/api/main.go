@@ -22,9 +22,10 @@ import (
 // becomes DB-backed (real, paginated exception_log rows via store.ExceptionLister, worst
 // amount-at-risk first -- see internal/api/server.go's listExceptions) and it also wires the
 // AI explainer (GEMINI_API_KEY/LLM_MODEL, AI_BUDGET_PER_BATCH_USD, REDIS_ADDR) behind
-// POST /v1/exceptions/{id}/explain. When DB_DSN is unset, the API still starts -- with
+// POST /v1/exceptions/{id}/explain, and POST /v1/qa and POST /v1/ingest/verify-chain (the
+// HTTP twin of `reconctl verify-chain`) are served from the same store. When DB_DSN is unset, the API still starts -- with
 // /v1/exceptions falling back to whatever's in Server.Exceptions (empty by default here) and
-// the explain route degrading to its "not configured" response -- because the
+// the explain, qa and verify-chain routes degrading to their "not configured" 503 -- because the
 // ingestion/matching-only smoke test path (implementation.md section 12) must keep working
 // even before a database or the AI layer is configured.
 func main() {
@@ -57,6 +58,7 @@ func main() {
 		}
 		mysqlStore := store.OpenMySQLStore(db)
 		server.Store = mysqlStore
+		server.Audit = mysqlStore
 		server.Explainer = buildExplainer(mysqlStore)
 		server.QA = buildQAAgent(mysqlStore, server.Explainer)
 	}

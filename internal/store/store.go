@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/audit"
 )
 
 // ErrDuplicate is returned when an idempotency or uniqueness constraint already holds the row.
@@ -93,6 +95,16 @@ type IngestStore interface {
 // coverage available," never as an error.
 type AuditWriter interface {
 	WriteAuditEntry(ctx context.Context, entry AuditEntryRow) error
+}
+
+// AuditReader is satisfied by any store that can read the whole audit_log back, in insertion
+// order, as audit.Entry values ready for audit.Verify. It is the read-side counterpart of
+// AuditWriter and is kept just as narrow: POST /v1/ingest/verify-chain (internal/api) needs
+// to re-check the hash chain and nothing else, so it is handed this one method and not the
+// rest of ReconStore. Entries come back with CreatedAt already in UTC and PreviousHash "" for
+// the first row, the exact shape audit.Verify expects.
+type AuditReader interface {
+	LoadAuditEntries(ctx context.Context) ([]audit.Entry, error)
 }
 
 // PaymentCandidate is a payment loaded for reconciliation matching.

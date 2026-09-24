@@ -6,12 +6,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
-	"log"
+	"time"
+
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/ai"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/ai/qa"
+	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/audit"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/recon"
 	"github.com/Immortal-Beyond-Oblivion/SettleTrace/internal/store"
 )
@@ -58,6 +61,11 @@ type Server struct {
 	// QA backs POST /v1/qa. Optional: when nil the route degrades to 503, same convention as
 	// Store/Explainer above, so the API still starts and serves every other route without it.
 	QA QAAnswerer
+
+	// Audit backs POST /v1/ingest/verify-chain. Optional: when nil the route degrades to 503,
+	// same convention as Store/Explainer/QA above. It is the read-only store.AuditReader, so this
+	// route can re-check the hash chain but has no way to write to audit_log.
+	Audit store.AuditReader
 }
 
 // Routes returns the configured HTTP handler tree.
@@ -68,6 +76,7 @@ func (server Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/exceptions/", server.resolveException)
 	mux.HandleFunc("POST /v1/exceptions/{id}/explain", server.explainException)
 	mux.HandleFunc("POST /v1/qa", server.askQuestion)
+	mux.HandleFunc("POST /v1/ingest/verify-chain", server.verifyChain)
 	return mux
 }
 
@@ -106,28 +115,34 @@ func (server Server) listExceptions(writer http.ResponseWriter, request *http.Re
 		cursor = decoded
 	}
 
-	records, err := lister.ListUnresolvedExceptions(request.Context(), limit, cursor)
+	// Ask the store for one row more than the page size. That extra row is never returned to the
+	// caller; it exists only to prove another page follows. Deciding "is there a next page" from
+	// len(records) == limit alone is wrong whenever the total row count is an exact multiple of
+	// the page size: the final, full page would still carry a next_cursor, and following it
+	// would cost the caller one more round trip that returns zero rows.
+	records, err := lister.ListUnresolvedExceptions(request.Context(), limit+1, cursor)
 	if err != nil {
 		writeJSON(writer, http.StatusInternalServerError, map[string]string{"error": "failed to load exceptions"})
 		return
+	}
+	hasMore := len(records) > limit
+	if hasMore {
+		records = records[:limit]
 	}
 
 	exceptions := make([]map[string]any, 0, len(records))
 	for _, record := range records {
 		exceptions = append(exceptions, map[string]any{
-			"id":                    record.ID,
-			"reason_code":           record.ReasonCode,
-			"amount_at_risk_paise":  record.AmountAtRiskPaise,
-			"evidence":              record.EvidenceJSON,
-			"resolved_at":           record.ResolvedAt,
+			"id":                   record.ID,
+			"reason_code":          record.ReasonCode,
+			"amount_at_risk_paise": record.AmountAtRiskPaise,
+			"evidence":             record.EvidenceJSON,
+			"resolved_at":          record.ResolvedAt,
 		})
 	}
 
 	response := map[string]any{"exceptions": exceptions}
-	// A next_cursor is only emitted when the page came back full -- a short page means this
-	// was the last one, and handing back a cursor anyway would let a caller make one more
-	// pointless round trip that returns zero rows.
-	if len(records) == limit {
+	if hasMore {
 		last := records[len(records)-1]
 		response["next_cursor"] = encodeExceptionCursor(store.ExceptionCursor{AmountAtRiskPaise: last.AmountAtRiskPaise, ID: last.ID})
 	}
@@ -275,6 +290,43 @@ func (server Server) askQuestion(writer http.ResponseWriter, request *http.Reque
 		return
 	}
 	writeJSON(writer, http.StatusOK, answer)
+}
+
+// verifyChainTimeout bounds one full audit_log read plus hash verification.
+const verifyChainTimeout = 30 * time.Second
+
+// verifyChain re-verifies the audit_log hash chain end to end, the HTTP twin of
+// `reconctl verify-chain` (implementation.md section 26). Both read the same rows the same way
+// and call the same audit.Verify, so they always agree. A broken chain is a successful
+// verification with a negative result, so it answers 200 with verified=false plus the first
+// bad position -- only "not configured" (503) and a failure to read the table (500) are errors.
+// first_break_at_row is the 0-based position in insertion order (id ASC), same as reconctl.
+func (server Server) verifyChain(writer http.ResponseWriter, request *http.Request) {
+	if server.Audit == nil {
+		writeJSON(writer, http.StatusServiceUnavailable, map[string]string{"error": "audit log not configured"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(request.Context(), verifyChainTimeout)
+	defer cancel()
+
+	entries, err := server.Audit.LoadAuditEntries(ctx)
+	if err != nil {
+		log.Printf("verify-chain: load audit_log failed: %v", err)
+		writeJSON(writer, http.StatusInternalServerError, map[string]string{"error": "failed to read audit log"})
+		return
+	}
+
+	brokenAt, verifyErr := audit.Verify(entries)
+	if verifyErr != nil {
+		writeJSON(writer, http.StatusOK, map[string]any{
+			"verified":           false,
+			"first_break_at_row": brokenAt,
+			"detail":             verifyErr.Error(),
+		})
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"verified": true, "rows_checked": len(entries)})
 }
 
 // writeJSON writes one JSON response with a deterministic content type.
